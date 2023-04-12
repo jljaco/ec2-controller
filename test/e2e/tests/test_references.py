@@ -43,7 +43,7 @@ def wait_for_delete_or_die(ec2_client, vpc_endpoint_id, timeout):
 @service_marker
 @pytest.mark.canary
 class TestEC2References:
-    def test_references(self, ec2_client):
+    def test_vpc_endpoint_references(self, ec2_client):
         vpc_endpoint_name = random_suffix_name("vpc-endpoint-test", 24)
         vpc_name = random_suffix_name("vpc-ref-test", 24)
         subnet_name = random_suffix_name("subnet-ref-test", 24)
@@ -167,4 +167,100 @@ class TestEC2References:
         ec2_validator.assert_vpc_endpoint(vpc_endpoint_id, exists=False)
         ec2_validator.assert_subnet(subnet_id, exists=False)
         ec2_validator.assert_security_group(sg_id, exists=False)
+        ec2_validator.assert_vpc(vpc_id, exists=False)
+
+    def test_route_table_references(self, ec2_client):
+        vpc_name = random_suffix_name("vpc-ref-test", 24)
+        igw_name = random_suffix_name("igw-ref-test", 24)
+        rt_name = random_suffix_name("rt-ref-test", 24)
+
+        test_values = REPLACEMENT_VALUES.copy()
+        test_values["ROUTE_TABLE_NAME"] = rt_name
+        test_values["INTERNET_GATEWAY_NAME"] = igw_name
+        test_values["VPC_NAME"] = vpc_name
+        test_values["CIDR_BLOCK"] = "10.0.0.0/16"
+        test_values["SUBNET_CIDR_BLOCK"] = "10.0.255.0/24"
+        
+        # Load CRs
+        rt_data = load_ec2_resource(
+            "route_table_ref",
+            additional_replacements=test_values,
+        )
+        igw_data = load_ec2_resource(
+            "internet_gateway_ref",
+            additional_replacements=test_values,
+        )
+        vpc_resource_data = load_ec2_resource(
+            "vpc",
+            additional_replacements=test_values,
+        )
+
+        # This test creates resources in reverse order (VPC last) so that reference
+        # resolution fails upon resource creation. Eventually, resources become synced
+        # and references resolve.
+
+        # Create Route Table. Requires: VPC and InternetGateway
+        rt_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, 'routetables',
+            rt_name, namespace="default",
+        )
+        k8s.create_custom_resource(rt_ref, rt_data)
+
+        # Create IGW. Requires: VPC
+        igw_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, 'internetgateways',
+            igw_name, namespace="default",
+        )
+        k8s.create_custom_resource(igw_ref, igw_data)
+
+        # Create VPC. Requires: None
+        vpc_ref = k8s.CustomResourceReference(
+            CRD_GROUP, CRD_VERSION, 'vpcs',
+            vpc_name, namespace="default",
+        )
+        k8s.create_custom_resource(vpc_ref, vpc_resource_data)
+
+        # Wait a few seconds so resources get persisted in etcd
+        time.sleep(CREATE_WAIT_AFTER_SECONDS)
+
+        # Check resources sync & resolve
+        assert k8s.wait_on_condition(vpc_ref, "ACK.ResourceSynced", "True", wait_periods=5)
+        assert k8s.wait_on_condition(igw_ref, "ACK.ResourceSynced", "True", wait_periods=5)
+        assert k8s.wait_on_condition(rt_ref, "ACK.ResourceSynced", "True", wait_periods=5)
+
+        # Acquire resource IDs
+        rt_cr = k8s.get_resource(rt_ref)
+        rt_id = rt_cr["status"]["routeTableID"]
+        igw_cr = k8s.get_resource(igw_ref)
+        igw_id = igw_cr["status"]["internetGatewayID"]
+        vpc_cr = k8s.get_resource(vpc_ref)
+        vpc_id = vpc_cr["status"]["vpcID"]
+
+        # Check resources exist in AWS
+        ec2_validator = EC2Validator(ec2_client)
+        ec2_validator.assert_route_table(rt_id)
+        ec2_validator.assert_internet_gateway(igw_id)
+        ec2_validator.assert_vpc(vpc_id)
+
+        # Delete resources
+        _, deleted = k8s.delete_custom_resource(rt_ref, 6, 5)
+        assert deleted is True
+        
+        # If RouteTable is not completely removed server-side, then remaining
+        # resources will NOT delete successfully due to dependency exceptions
+        now = datetime.datetime.now()
+        timeout = now + datetime.timedelta(seconds=DELETE_TIMEOUT_SECONDS)
+        wait_for_delete_or_die(ec2_client, rt_id, timeout)
+
+        _, deleted = k8s.delete_custom_resource(igw_ref, 6, 5)
+        assert deleted is True
+        time.sleep(DELETE_WAIT_AFTER_SECONDS)
+
+        _, deleted = k8s.delete_custom_resource(vpc_ref, 6, 5)
+        assert deleted is True
+        time.sleep(DELETE_WAIT_AFTER_SECONDS)
+
+        # Check resources no longer exist in AWS
+        ec2_validator.assert_route_table(rt_id, exists=False)
+        ec2_validator.assert_internet_gateway(igw_id, exists=False)
         ec2_validator.assert_vpc(vpc_id, exists=False)
